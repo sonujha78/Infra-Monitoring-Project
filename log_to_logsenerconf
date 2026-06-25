@@ -1,0 +1,8 @@
+module(load="omelasticsearch")
+
+action(
+  type="omelasticsearch"
+  server="elasticsearch"
+  serverport="9200"
+  searchIndex="rsyslog-%$YEAR%-%$MONTH%-%$DAY%"
+)
