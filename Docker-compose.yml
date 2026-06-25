@@ -1,0 +1,230 @@
+version: "3.9"
+
+networks:
+  infra-net:
+    driver: bridge
+
+volumes:
+  pg_primary_data:
+  pg_replica_data:
+  es_data:
+
+services:
+
+  # ---------------- DATABASE ----------------
+  postgres-primary:
+    image: postgres:16
+    container_name: postgres-primary
+    restart: always
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin123
+      POSTGRES_DB: employeedb
+    volumes:
+      - pg_primary_data:/var/lib/postgresql/data
+    networks:
+      - infra-net
+
+  postgres-replica:
+    image: postgres:16
+    container_name: postgres-replica
+    restart: always
+    environment:
+      PGPASSWORD: admin123
+    volumes:
+      - pg_replica_data:/var/lib/postgresql/data
+    networks:
+      - infra-net
+    command: >
+      bash -c "
+      rm -rf /var/lib/postgresql/data/* &&
+      pg_basebackup -h postgres-primary -U admin -D /var/lib/postgresql/data -Fp -Xs -P -R &&
+      chmod 0700 /var/lib/postgresql/data &&
+      chown -R postgres:postgres /var/lib/postgresql/data &&
+      su postgres -c 'postgres -D /var/lib/postgresql/data'
+      "
+  
+
+  postgres-exporter-primary:
+    image: prometheuscommunity/postgres-exporter
+    container_name: postgres-exporter-primary
+    environment:
+      DATA_SOURCE_NAME: "postgresql://admin:admin123@postgres-primary:5432/employeedb?sslmode=disable"
+    ports:
+      - "9187:9187"
+    networks:
+      - infra-net
+    depends_on:
+      - postgres-primary
+
+  postgres-exporter-replica:
+    image: prometheuscommunity/postgres-exporter
+    container_name: postgres-exporter-replica
+    environment:
+      DATA_SOURCE_NAME: "postgresql://admin:admin123@postgres-replica:5432/employeedb?sslmode=disable"
+    ports:
+      - "9188:9187"
+    networks:
+      - infra-net
+    depends_on:
+      - postgres-replica
+
+  # ---------------- PGPOOL ----------------
+  pgpool:
+    image: mrgreen007/pgpool:4.6.4
+    container_name: pgpool
+    restart: always
+    
+    ports:
+      - "9999:5432"
+
+    environment:
+      PGPOOL_BACKEND_NODES: "0:postgres-primary:5432,1:postgres-replica:5432"
+
+      PGPOOL_SR_CHECK_USER: admin
+      PGPOOL_SR_CHECK_PASSWORD: admin123
+
+      PGPOOL_POSTGRES_USERNAME: admin
+      PGPOOL_POSTGRES_PASSWORD: admin123
+
+      PGPOOL_ADMIN_USERNAME: admin
+      PGPOOL_ADMIN_PASSWORD: admin123
+
+      PGPOOL_PCP_USER: admin
+      PGPOOL_PCP_PASSWORD: admin123
+
+      PGPOOL_ENABLE_POOL_HBA: "no"
+      PGPOOL_ENABLE_LOAD_BALANCING: "yes"
+
+    depends_on:
+      - postgres-primary
+      - postgres-replica
+
+    networks:
+      - infra-net
+
+  # ---------------- TOMCAT CLUSTER ----------------
+  tomcat1:
+    image: tomcat:10.1-jdk21
+    container_name: tomcat1
+    ports:
+      - "8082:8080"
+    environment:
+      DB_HOST: pgpool
+    depends_on:
+      - pgpool
+    volumes:
+      - ./app/employee-app/target/ROOT.war:/usr/local/tomcat/webapps/ROOT.war
+    networks:
+      - infra-net
+
+  tomcat2:
+    image: tomcat:10.1-jdk21
+    container_name: tomcat2
+    ports:
+      - "8083:8080"
+    environment:
+      DB_HOST: pgpool
+    depends_on:
+      - pgpool
+    volumes:
+      - ./app/employee-app/target/ROOT.war:/usr/local/tomcat/webapps/ROOT.war
+    networks:
+      - infra-net
+
+
+  # ---------------- MONITORING ----------------
+  prometheus:
+    image: prom/prometheus
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    networks:
+      - infra-net
+
+
+  grafana:
+    image: grafana/grafana
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    networks:
+      - infra-net
+
+
+  node-exporter:
+    image: prom/node-exporter
+    container_name: node-exporter
+    ports:
+      - "9100:9100"
+    networks:
+      - infra-net
+
+
+  # ---------------- LOGGING ----------------
+  rsyslog:
+    build:
+      context: ./config
+      dockerfile: Dockerfile.rsyslog
+    container_name: rsyslog
+    ports:
+      - "514:514"
+      - "514:514/udp"
+    networks:
+      - infra-net
+    depends_on:
+      - elasticsearch
+  # ---------------- LOAD BALANCER ----------------
+  haproxy:
+    image: haproxy:latest
+    container_name: haproxy
+    ports:
+      - "8088:80"
+      - "8404:8404"
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg
+    networks:
+      - infra-net
+
+
+  haproxy-exporter:
+    image: prom/haproxy-exporter
+    container_name: haproxy-exporter
+    command:
+      - "--haproxy.scrape-uri=http://haproxy:8404/stats;csv"
+    ports:
+      - "9101:9101"
+    networks:
+      - infra-net
+    depends_on:
+      - haproxy
+
+
+  # ---------------- ELK ----------------
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.14.1
+    container_name: elasticsearch
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    networks:
+      - infra-net
+
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.14.1
+    container_name: kibana
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    depends_on:
+      - elasticsearch
+    networks:
+      - infra-net
